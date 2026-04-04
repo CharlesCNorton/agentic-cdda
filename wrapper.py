@@ -10,6 +10,8 @@ Usage (from WSL):
     wrapper.py diff         # capture, show only lines changed since last
     wrapper.py diff do KEY  # send, wait, capture, show only changes
     wrapper.py raw          # dump raw tmux pane (for debugging)
+    wrapper.py bail         # hammer Escape until main menu or game screen
+    wrapper.py batch K1,K2  # send comma-separated keys with delays
 """
 import subprocess, sys, re, time, os
 
@@ -64,6 +66,12 @@ def wait_for_change(timeout=3.0, interval=0.15):
 # ---------------------------------------------------------------------------
 
 def detect_mode(text):
+    # Search dialog overlaid on chargen
+    if 'Search:' in text and ('SCENARIO' in text or 'PROFESSION' in text):
+        return 'chargen_search'
+    # Achievement lock popup
+    if 'You must complete the achievement' in text:
+        return 'locked'
     # Character creation
     if 'SCENARIO' in text and 'PROFESSION' in text and 'STATS' in text:
         if '[TRAITS]' in text:
@@ -291,14 +299,22 @@ def parse_chargen(raw):
     # Rejoin wrapped right-panel text
     right = _rejoin_wrapped(right)
 
-    # Mark the selected item
+    # Detect lock messages in right panel
+    locked = False
+    for line in right:
+        if 'You must complete' in line or 'to unlock' in line:
+            locked = True
+            break
+
+    # Mark the selected item (and flag if locked)
     selected = _find_selected(right)
+    lock_tag = ' [LOCKED]' if locked else ''
     if selected:
         marked = []
         for line in left:
             bare = line.strip()
             if bare == selected or selected.startswith(bare):
-                marked.append(f'> {bare}')
+                marked.append(f'> {bare}{lock_tag}')
             else:
                 marked.append(f'  {bare}')
         left = marked
@@ -410,12 +426,71 @@ def save_capture(lines):
 # Main
 # ---------------------------------------------------------------------------
 
+def bail():
+    """Hammer Escape until we reach the main menu or game screen.
+    Handles confirmation dialogs (Y/N) along the way."""
+    for _ in range(20):
+        raw = capture_raw()
+        mode = detect_mode(raw)
+        if mode in ('game', 'main_menu'):
+            return raw, mode
+        # Handle Y/N confirmation dialogs
+        if 'Return to main menu?' in raw or re.search(r'\[Y\]es\s+\[N\]o', raw):
+            send_keys('Y')
+            time.sleep(0.5)
+            continue
+        # Handle search dialogs
+        if 'Search:' in raw:
+            send_keys('Escape')
+            time.sleep(0.3)
+            continue
+        # Handle lock popups
+        if 'You must complete the achievement' in raw:
+            send_keys('Escape')
+            time.sleep(0.3)
+            continue
+        send_keys('Escape')
+        time.sleep(0.4)
+    return capture_raw(), detect_mode(capture_raw())
+
+
+def batch(keys_csv):
+    """Send comma-separated keys with short delays between each."""
+    keys = [k.strip() for k in keys_csv.split(',') if k.strip()]
+    for key in keys:
+        send_keys(key)
+        time.sleep(0.25)
+    time.sleep(0.3)
+    return capture_raw()
+
+
 def main():
     args = list(sys.argv[1:])
 
     # --- raw dump ---
     if args and args[0] == 'raw':
         print(capture_raw(), end='')
+        return
+
+    # --- bail: escape to main menu or game ---
+    if args and args[0] == 'bail':
+        raw, mode = bail()
+        result = parse(raw, mode)
+        result = [l for l in result if not l.startswith('wsl:')]
+        print(f'[{mode}]')
+        for l in result:
+            print(l)
+        return
+
+    # --- batch: send multiple keys ---
+    if args and args[0] == 'batch' and len(args) > 1:
+        raw = batch(args[1])
+        mode = detect_mode(raw)
+        result = parse(raw, mode)
+        result = [l for l in result if not l.startswith('wsl:')]
+        print(f'[{mode}]')
+        for l in result:
+            print(l)
         return
 
     # --- send-only ---
