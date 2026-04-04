@@ -1,0 +1,2 @@
+#!/bin/bash
+exec /c/Python313/python.exe "D:/cataclysm-dda/cdda.py" "$@"
