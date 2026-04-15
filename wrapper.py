@@ -13,29 +13,75 @@ Usage (from WSL):
     wrapper.py bail         # hammer Escape until main menu or game screen
     wrapper.py batch K1,K2  # send comma-separated keys with delays
 """
-import subprocess, sys, re, time, os
+import os
+import re
+import subprocess
+import sys
+import time
 
-SESSION = 'cdda'
+SESSION = os.environ.get('CDDA_TMUX_SESSION', 'cdda')
+
+BOX_VERT = '\u2502'
+BOX_TL = '\u250c'
+BOX_TR = '\u2510'
+BOX_BL = '\u2514'
+BOX_BR = '\u2518'
+BOX_L = '\u251c'
+BOX_R = '\u2524'
+BOX_H = '\u2500'
+BOX_T = '\u252c'
+BOX_B = '\u2534'
+BOX_X = '\u253c'
+SELECTED_MARK = '\u00bb'
 
 # Map/minimap characters. Includes @ (player/NPC map marker).
 # The is_map_segment() function special-cases lone @ to preserve it in
 # compass directions and NPC lists.
-MAP_CHARS = frozenset('.#@>{}+\"*F~%│┘┌└┬┤├┴┐┼─═║╔╗╚╝^v')
+MAP_CHARS = frozenset(
+    '.#@>{}+"*F~%^v'
+    + BOX_VERT + BOX_TL + BOX_TR + BOX_BL + BOX_BR + BOX_L + BOX_R
+    + BOX_H + BOX_T + BOX_B + BOX_X
+    + '\u2550\u2551\u2554\u2557\u255a\u255d'
+)
 
-BORDER = '│┌┐└┘├┤─┬┴┼'
+BORDER = BOX_VERT + BOX_TL + BOX_TR + BOX_BL + BOX_BR + BOX_L + BOX_R + BOX_H + BOX_T + BOX_B + BOX_X
 
-LAST_CAPTURE = '/tmp/cdda_last_capture.txt'
+LAST_CAPTURE = os.environ.get('CDDA_LAST_CAPTURE', '/tmp/cdda_last_capture.txt')
+STOP_MODES = {'confirm', 'death', 'keybindings', 'locked', 'loading', 'main_menu', 'pause_menu', 'popup'}
+STATUS_TAIL_MARKERS = (
+    'Focus:', 'Move:', 'Power:', 'Safe:', 'Activity:', 'Weary Malus:',
+    'Thirst:', 'Hunger:', 'Weight:', 'Temperature:', 'Weather:',
+    'Moon:', 'Date:', 'Time:', 'Wind:',
+)
+
+
+class TmuxError(RuntimeError):
+    pass
+
 
 # ---------------------------------------------------------------------------
 # Core I/O
 # ---------------------------------------------------------------------------
 
-def capture_raw():
-    r = subprocess.run(
-        ['tmux', 'capture-pane', '-t', SESSION, '-p'],
-        capture_output=True, text=True,
+def run_tmux(*args):
+    result = subprocess.run(
+        ['tmux', *args],
+        capture_output=True,
+        text=True,
+        encoding='utf-8',
+        errors='replace',
     )
-    return r.stdout
+    if result.returncode == 0:
+        return result
+
+    detail = (result.stderr or result.stdout or '').strip()
+    if not detail:
+        detail = f'tmux {" ".join(args)} failed with exit code {result.returncode}'
+    raise TmuxError(detail)
+
+
+def capture_raw():
+    return run_tmux('capture-pane', '-t', SESSION, '-p').stdout
 
 
 def send_keys(*keys):
@@ -43,27 +89,57 @@ def send_keys(*keys):
     tmux interpreting ; and other metacharacters."""
     for key in keys:
         if len(key) == 1:
-            subprocess.run(['tmux', 'send-keys', '-t', SESSION, '-l', key])
+            run_tmux('send-keys', '-t', SESSION, '-l', key)
         else:
-            subprocess.run(['tmux', 'send-keys', '-t', SESSION, key])
+            run_tmux('send-keys', '-t', SESSION, key)
 
 
-def wait_for_change(timeout=3.0, interval=0.15):
+def wait_for_change(before=None, timeout=3.0, interval=0.15):
     """Poll until the screen content changes or timeout is reached."""
-    before = capture_raw()
+    if before is None:
+        before = capture_raw()
+    latest = before
     elapsed = 0.0
     while elapsed < timeout:
         time.sleep(interval)
         elapsed += interval
-        after = capture_raw()
-        if after != before:
-            time.sleep(0.1)          # let the screen stabilize
+        latest = capture_raw()
+        if latest != before:
+            time.sleep(0.1)  # let the screen stabilize
             return capture_raw()
-    return capture_raw()             # timeout — return whatever we have
+    return latest
+
+
+def drive_keys(keys, timeout=3.0):
+    """Send keys one at a time, waiting for each change and stopping on
+    blocking modal states so later keys do not spill into the wrong screen."""
+    raw = capture_raw()
+    for key in keys:
+        before = raw
+        send_keys(key)
+        raw = wait_for_change(before=before, timeout=timeout)
+        if detect_mode(raw) in STOP_MODES:
+            break
+    return raw
+
 
 # ---------------------------------------------------------------------------
 # Mode detection
 # ---------------------------------------------------------------------------
+
+def looks_like_popup(text):
+    lines = [line.rstrip() for line in text.split('\n') if line.strip()]
+    if len(lines) < 3:
+        return False
+    first = lines[0].lstrip()
+    if not first.startswith(BOX_TL):
+        return False
+    bordered = sum(
+        1 for line in lines
+        if line.lstrip().startswith((BOX_TL, BOX_VERT, BOX_BL))
+    )
+    return bordered >= max(3, len(lines) // 2)
+
 
 def detect_mode(text):
     # Search dialog overlaid on chargen
@@ -85,6 +161,12 @@ def detect_mode(text):
         return 'dialogue'
     if '[c] Creature' in text and '[t] Terrain' in text:
         return 'extended'
+    if 'KEYBINDINGS' in text and '[f] Filter' in text:
+        return 'keybindings'
+    if 'MAIN MENU' in text and 'Save and quit' in text:
+        return 'pause_menu'
+    if 'Load character from "' in text and 'Back to Main Menu' in text:
+        return 'load_menu'
     if re.search(r'Items \(\d+\)', text) and 'Monsters' in text:
         return 'surroundings'
     if 'Press f, F, or / to filter' in text and re.search(r'^\s*[v^]\s', text, re.MULTILINE):
@@ -93,25 +175,61 @@ def detect_mode(text):
         return 'overlay'
     if 'Select your language' in text:
         return 'lang_menu'
-    if 'Custom Character' in text or 'Play Now' in text:
+    if (
+        'Custom Character' in text or 'Play Now' in text
+        or ('[MOTD]' in text and '[Quit]' in text)
+        or ('[New Game]' in text and '[Load]' in text and '[Credits]' in text)
+    ):
         return 'main_menu'
     if re.search(r'\[Y\]es\s+\[N\]o', text):
         return 'confirm'
+    if 'The End' in text and 'In memory of:' in text:
+        return 'death'
+    if 'Your scores' in text and 'ACHIEVEMENTS' in text and 'KILLS' in text:
+        return 'postmortem'
     if 'Loading files' in text or 'Verifying' in text or 'Finalizing' in text:
         return 'loading'
+    if looks_like_popup(text):
+        return 'popup'
     return 'game'
+
 
 # ---------------------------------------------------------------------------
 # Segment helpers
 # ---------------------------------------------------------------------------
 
+def clean_text(text, extra_strip=''):
+    return text.strip(BORDER + extra_strip + ' ').strip()
+
+
+def trim_status_tail(text):
+    end = len(text)
+    for marker in STATUS_TAIL_MARKERS:
+        idx = text.find(marker)
+        if idx != -1 and idx < end:
+            end = idx
+    return text[:end].rstrip('<> ').strip()
+
+
+def unique_lines(lines):
+    out = []
+    seen = set()
+    for line in lines:
+        if not line or line in seen:
+            continue
+        seen.add(line)
+        out.append(line)
+    return out
+
+
 def is_map_segment(s):
     """True if segment is purely map/minimap characters (no readable text).
-    A lone @ is kept — it marks the player in compass / NPC lists."""
+    A lone @ is kept because it marks the player in compass and NPC lists."""
     stripped = s.strip()
     if stripped == '@':
         return False
     return len(stripped) > 0 and all(c in MAP_CHARS or c == ' ' for c in s)
+
 
 # ---------------------------------------------------------------------------
 # Message extraction (top-of-screen game messages)
@@ -127,14 +245,13 @@ def extract_top_messages(raw):
             continue
         for seg in re.split(r' {2,}', left):
             seg = seg.strip()
-            if not seg:
+            if not seg or is_map_segment(seg):
                 continue
-            if is_map_segment(seg):
-                continue
-            cleaned = seg.strip(BORDER).strip()
+            cleaned = clean_text(seg)
             if cleaned and any(c.isalpha() for c in cleaned):
                 msgs.append(cleaned)
     return msgs
+
 
 # ---------------------------------------------------------------------------
 # Parsers
@@ -144,10 +261,9 @@ def parse_default(raw):
     """Universal parser: strip map, keep text, prepend messages."""
     out = []
 
-    # Top-of-screen messages
     top_msgs = extract_top_messages(raw)
-    for m in top_msgs:
-        out.append(f'> {m}')
+    for message in top_msgs:
+        out.append(f'> {message}')
 
     seen_msgs = set(top_msgs)
 
@@ -159,16 +275,13 @@ def parse_default(raw):
         kept = []
         for seg in segments:
             seg = seg.strip()
-            if not seg:
+            if not seg or is_map_segment(seg):
                 continue
-            if is_map_segment(seg):
-                continue
-            cleaned = seg.strip(BORDER).strip()
+            cleaned = clean_text(seg)
             if cleaned:
                 kept.append(cleaned)
         if kept:
             joined = '  '.join(kept)
-            # skip if it duplicates a message we already printed
             if joined in seen_msgs:
                 continue
             out.append(joined)
@@ -184,13 +297,12 @@ def parse_messages(raw):
             continue
         border_col = -1
         for i, ch in enumerate(r):
-            if ch == '│' and 30 <= i <= 40:
+            if ch == BOX_VERT and 30 <= i <= 40:
                 border_col = i
                 break
         if border_col > 0:
-            left = r[:border_col].strip('│├┤┌┐└┘─^v ').strip()
+            left = clean_text(r[:border_col], '^v')
             left = re.sub(r'^\d+\s+seconds?\s+', '', left)
-            left = left.strip(BORDER).strip()
             if left:
                 msgs.append(left)
             right_segs = re.split(r' {2,}', r[border_col + 1:])
@@ -199,15 +311,17 @@ def parse_messages(raw):
                 seg = seg.strip()
                 if not seg or is_map_segment(seg):
                     continue
-                cleaned = seg.strip(BORDER).strip()
+                cleaned = clean_text(seg)
                 if cleaned:
                     kept.append(cleaned)
             if kept:
                 sidebar.append('  '.join(kept))
         else:
-            cleaned = r.strip().strip(BORDER).strip()
+            cleaned = clean_text(r)
             if cleaned and any(c.isalnum() for c in cleaned):
                 msgs.append(cleaned)
+
+    msgs = _rejoin_wrapped(msgs)
 
     out = []
     if msgs:
@@ -221,13 +335,12 @@ def parse_messages(raw):
 
 
 def _rejoin_wrapped(lines):
-    """Join continuation lines (start with lowercase or punctuation) to the
-    previous line so that wrapped descriptions read as coherent paragraphs."""
+    """Join continuation lines so wrapped descriptions stay readable."""
     if not lines:
         return lines
     out = [lines[0]]
     for line in lines[1:]:
-        if line and (line[0].islower() or line[0] in ',.;:!?)\'\"'):
+        if line and (line[0].islower() or line[0] in ',.;:!?)\'"'):
             out[-1] += ' ' + line
         else:
             out.append(line)
@@ -237,16 +350,14 @@ def _rejoin_wrapped(lines):
 def _find_selected(right_lines):
     """Return the name shown in the Identity: line of the details panel."""
     for line in right_lines:
-        m = re.match(r'Identity:\s*(.+?)(?:\s*\(male\)|\s*\(female\))', line)
-        if m:
-            return m.group(1).strip()
+        match = re.match(r'Identity:\s*(.+?)(?:\s*\(male\)|\s*\(female\))', line)
+        if match:
+            return match.group(1).strip()
     return ''
 
 
 def parse_chargen(raw):
-    """Two-column chargen (scenario, profession, background, skills, desc).
-    Splits left list from right details, rejoins wrapped text, marks the
-    currently selected item."""
+    """Two-column chargen view with selection marked in the left column."""
     left, right = [], []
     tabs = ''
 
@@ -255,40 +366,38 @@ def parse_chargen(raw):
         if not r.strip():
             continue
 
-        # Tab bar
         if 'SCENARIO' in r and 'PROFESSION' in r:
             active = re.search(r'\[([A-Z]+)\]', r)
             active_tab = active.group(1) if active else ''
             tab_names = re.findall(r'[A-Z]{3,}', r)
             tabs = ' | '.join(
-                f'[{t}]' if t == active_tab else t for t in tab_names)
+                f'[{tab}]' if tab == active_tab else tab for tab in tab_names
+            )
             continue
 
-        # Summary / filter lines
         if 'Summary |' in r or 'Lifestyle:' in r:
-            left.append(r.strip(BORDER).strip())
+            left.append(clean_text(r))
             continue
         if '[s] sort' in r or '[f, F' in r:
             continue
         if 'Press ?' in r or 'Press k,' in r or 'Press l,' in r or 'Press TAB' in r:
             continue
 
-        # Split at │ divider near column 40
         divider = -1
         for i, ch in enumerate(r):
-            if ch == '│' and 35 <= i <= 45:
+            if ch == BOX_VERT and 35 <= i <= 45:
                 divider = i
                 break
 
         if divider > 0:
-            l = r[:divider].strip(BORDER + ' ^v').strip()
-            ri = r[divider + 1:].strip(BORDER + ' ^v').strip()
-            if l:
-                left.append(l)
-            if ri:
-                right.append(ri)
+            left_part = clean_text(r[:divider], '^v')
+            right_part = clean_text(r[divider + 1:], '^v')
+            if left_part:
+                left.append(left_part)
+            if right_part:
+                right.append(right_part)
         else:
-            cleaned = r.strip(BORDER + ' ^v').strip()
+            cleaned = clean_text(r, '^v')
             if cleaned and any(c.isalnum() for c in cleaned):
                 indent = len(r) - len(r.lstrip())
                 if indent > 30:
@@ -296,17 +405,9 @@ def parse_chargen(raw):
                 else:
                     left.append(cleaned)
 
-    # Rejoin wrapped right-panel text
     right = _rejoin_wrapped(right)
 
-    # Detect lock messages in right panel
-    locked = False
-    for line in right:
-        if 'You must complete' in line or 'to unlock' in line:
-            locked = True
-            break
-
-    # Mark the selected item (and flag if locked)
+    locked = any('You must complete' in line or 'to unlock' in line for line in right)
     selected = _find_selected(right)
     lock_tag = ' [LOCKED]' if locked else ''
     if selected:
@@ -332,8 +433,7 @@ def parse_chargen(raw):
 
 
 def parse_chargen_traits(raw):
-    """Three-column trait screen: positive | negative | cosmetic,
-    with a description for the selected trait at the bottom."""
+    """Three-column trait screen with the selected description at the bottom."""
     col1, col2, col3 = [], [], []
     description = []
     tabs = ''
@@ -348,7 +448,8 @@ def parse_chargen_traits(raw):
             active_tab = active.group(1) if active else ''
             tab_names = re.findall(r'[A-Z]{3,}', r)
             tabs = ' | '.join(
-                f'[{t}]' if t == active_tab else t for t in tab_names)
+                f'[{tab}]' if tab == active_tab else tab for tab in tab_names
+            )
             continue
 
         if 'Summary' in r and 'Lifestyle' in r:
@@ -358,12 +459,11 @@ def parse_chargen_traits(raw):
         if 'sort:' in r or 'filter' in r or 'Press ?' in r:
             continue
 
-        # Three-column rows have at least 2 │ separators
-        if r.count('│') >= 2:
-            parts = r.split('│')
-            c1 = parts[0].strip(' ^v').strip()
-            c2 = parts[1].strip(' ^v').strip() if len(parts) > 1 else ''
-            c3 = parts[2].strip(' ^v').strip() if len(parts) > 2 else ''
+        if r.count(BOX_VERT) >= 2:
+            parts = r.split(BOX_VERT)
+            c1 = clean_text(parts[0], '^v')
+            c2 = clean_text(parts[1], '^v') if len(parts) > 1 else ''
+            c3 = clean_text(parts[2], '^v') if len(parts) > 2 else ''
             if c1:
                 col1.append(c1)
             if c2:
@@ -381,17 +481,204 @@ def parse_chargen_traits(raw):
         out.append('')
     if col1:
         out.append('--- Positive ---')
-        out.extend(f'  {t}' for t in col1)
+        out.extend(f'  {trait}' for trait in col1)
     if col2:
         out.append('--- Negative ---')
-        out.extend(f'  {t}' for t in col2)
+        out.extend(f'  {trait}' for trait in col2)
     if col3:
         out.append('--- Cosmetic ---')
-        out.extend(f'  {t}' for t in col3)
+        out.extend(f'  {trait}' for trait in col3)
     if description:
         out.append('')
         out.append('Selected: ' + ' '.join(description))
     return out
+
+
+def parse_main_menu(raw):
+    profiles = []
+    menu = []
+    notices = []
+
+    for line in raw.split('\n'):
+        r = line.rstrip()
+        if not r.strip():
+            continue
+
+        for cell in re.findall(rf'{BOX_VERT}([^{BOX_VERT}]+){BOX_VERT}', r):
+            cleaned = cell.strip()
+            if not cleaned or not any(ch.isalnum() for ch in cleaned):
+                continue
+            selected = cleaned.startswith(SELECTED_MARK)
+            cleaned = cleaned.lstrip(SELECTED_MARK + ' ').rstrip()
+            if not cleaned or len(cleaned) > 32:
+                continue
+            prefix = '> ' if selected else '  '
+            profiles.append(prefix + cleaned)
+
+        if '[' in r and ']' in r and '[Quit]' in r:
+            menu = re.findall(r'\[([^\]]+)\]', r)
+            continue
+
+        cleaned = clean_text(r)
+        if 'Tip of the day:' in cleaned or 'Bugs?' in cleaned:
+            notices.append(cleaned)
+
+    out = []
+    if profiles:
+        out.append('Profiles:')
+        out.extend(unique_lines(profiles))
+    if menu:
+        if out:
+            out.append('')
+        out.append('Menu: ' + ' | '.join(menu))
+    if notices:
+        if out:
+            out.append('')
+        out.extend(unique_lines(notices))
+    return out or parse_default(raw)
+
+
+def parse_load_menu(raw):
+    entries = []
+    for line in raw.split('\n'):
+        title = re.search(r'(Load character from "[^"]+")', line)
+        if title:
+            entries.append(title.group(1))
+            continue
+        option = re.search(r'(\d+\s+.+?\[\d{2}:\d{2}:\d{2}\])', line)
+        if option:
+            entries.append(re.sub(r'\s+', ' ', option.group(1)).strip())
+            continue
+        back = re.search(r'(q <- Back to Main Menu)', line)
+        if back:
+            entries.append(back.group(1))
+    return unique_lines(entries) or parse_popup(raw)
+
+
+def extract_question_candidates(line):
+    candidates = []
+    normalized = line.replace('(Case Sensitive)', ' ')
+    for match in re.finditer(r'[A-Z]', normalized):
+        tail = normalized[match.start():]
+        qpos = tail.find('?')
+        if qpos == -1:
+            continue
+        candidate = re.sub(r'\s+', ' ', tail[:qpos + 1]).strip()
+        word_count = len(candidate.split())
+        if 2 <= word_count <= 8 and len(candidate) <= 60:
+            candidates.append(candidate)
+    candidates.sort(key=lambda text: (len(text), text))
+    return candidates
+
+
+def parse_confirm(raw):
+    questions = []
+    for line in raw.split('\n'):
+        if '?' not in line:
+            continue
+        candidates = extract_question_candidates(trim_status_tail(line))
+        if candidates:
+            questions.append(candidates[0])
+    questions = unique_lines(questions)
+
+    out = []
+    if questions:
+        out.extend(questions)
+    out.append('Choices: [Y]es / [N]o')
+    return out
+
+
+def parse_death(raw):
+    out = []
+    if 'The End' in raw:
+        out.append('The End')
+
+    for label in ('In memory of:', 'Survived:', 'Kills:'):
+        for line in raw.split('\n'):
+            if label not in line:
+                continue
+            fragment = trim_status_tail(line[line.index(label):])
+            if fragment:
+                out.append(fragment)
+            break
+    return unique_lines(out) or parse_confirm(raw)
+
+
+def parse_postmortem(raw):
+    tabs = ''
+    body = []
+
+    for line in raw.split('\n'):
+        r = line.rstrip()
+        if not r.strip():
+            continue
+        if 'ACHIEVEMENTS' in r and 'CONDUCTS' in r and 'SCORES' in r and 'KILLS' in r:
+            tab_names = re.findall(r'ACHIEVEMENTS|CONDUCTS|SCORES|KILLS', r)
+            tabs = ' | '.join(tab_names)
+            continue
+
+        cleaned = clean_text(r)
+        if not cleaned or is_map_segment(cleaned):
+            continue
+        if cleaned == 'Your scores':
+            body.append(cleaned)
+            continue
+        if (
+            cleaned.startswith('0/')
+            or cleaned.startswith('Read ')
+            or cleaned.startswith('Gain ')
+            or cleaned.startswith('Better ')
+            or cleaned.startswith('Righty ')
+            or 'z level' in cleaned
+            or 'mechanics skill' in cleaned
+            or 'vehicle passenger' in cleaned
+            or re.match(r"^[A-Z][A-Za-z0-9'.,!?:;\- ]+$", cleaned)
+        ):
+            body.append(cleaned)
+
+    body = _rejoin_wrapped(body)
+
+    out = []
+    if tabs:
+        out.append(tabs)
+        out.append('')
+    out.extend(unique_lines(body))
+    return out or parse_default(raw)
+
+
+def parse_popup(raw):
+    out = []
+    for line in raw.split('\n'):
+        r = line.rstrip()
+        if not r.strip():
+            continue
+
+        stripped = r.strip()
+        if stripped and all(ch in BORDER + ' ' for ch in stripped):
+            continue
+
+        if BOX_VERT in r:
+            cells = [clean_text(part) for part in r.split(BOX_VERT)]
+            cells = [cell for cell in cells if cell]
+            if cells:
+                out.extend(cells)
+                continue
+
+        cleaned = clean_text(r)
+        if cleaned:
+            out.append(cleaned)
+
+    return _rejoin_wrapped(unique_lines(out))
+
+
+def parse_loading(raw):
+    lines = []
+    for line in raw.split('\n'):
+        cleaned = clean_text(line)
+        if cleaned and not is_map_segment(cleaned):
+            lines.append(cleaned)
+    return unique_lines(lines)
+
 
 # ---------------------------------------------------------------------------
 # Router
@@ -404,7 +691,26 @@ def parse(raw, mode):
         return parse_chargen(raw)
     if mode == 'chargen_traits':
         return parse_chargen_traits(raw)
+    if mode == 'main_menu':
+        return parse_main_menu(raw)
+    if mode == 'load_menu':
+        return parse_load_menu(raw)
+    if mode == 'confirm':
+        return parse_confirm(raw)
+    if mode == 'death':
+        return parse_death(raw)
+    if mode == 'postmortem':
+        return parse_postmortem(raw)
+    if mode == 'keybindings':
+        return parse_popup(raw)
+    if mode == 'pause_menu':
+        return parse_popup(raw)
+    if mode in {'overlay', 'popup'}:
+        return parse_popup(raw)
+    if mode == 'loading':
+        return parse_loading(raw)
     return parse_default(raw)
+
 
 # ---------------------------------------------------------------------------
 # Diff support
@@ -412,15 +718,16 @@ def parse(raw, mode):
 
 def load_prev():
     try:
-        with open(LAST_CAPTURE, 'r') as f:
-            return set(f.read().strip().split('\n'))
+        with open(LAST_CAPTURE, 'r', encoding='utf-8') as handle:
+            return set(handle.read().strip().split('\n'))
     except FileNotFoundError:
         return set()
 
 
 def save_capture(lines):
-    with open(LAST_CAPTURE, 'w') as f:
-        f.write('\n'.join(lines))
+    with open(LAST_CAPTURE, 'w', encoding='utf-8') as handle:
+        handle.write('\n'.join(lines))
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -428,106 +735,90 @@ def save_capture(lines):
 
 def bail():
     """Hammer Escape until we reach the main menu or game screen.
-    Handles confirmation dialogs (Y/N) along the way."""
+    Handles confirmation dialogs and popups along the way."""
     for _ in range(20):
         raw = capture_raw()
         mode = detect_mode(raw)
         if mode in ('game', 'main_menu'):
             return raw, mode
-        # Handle Y/N confirmation dialogs
-        if 'Return to main menu?' in raw or re.search(r'\[Y\]es\s+\[N\]o', raw):
+        if mode == 'confirm':
             send_keys('Y')
-            time.sleep(0.5)
+            wait_for_change(before=raw, timeout=1.5)
             continue
-        # Handle search dialogs
-        if 'Search:' in raw:
+        if mode in {'chargen_search', 'keybindings', 'locked', 'pause_menu', 'popup', 'postmortem', 'overlay', 'messages'}:
             send_keys('Escape')
-            time.sleep(0.3)
-            continue
-        # Handle lock popups
-        if 'You must complete the achievement' in raw:
-            send_keys('Escape')
-            time.sleep(0.3)
+            wait_for_change(before=raw, timeout=1.0)
             continue
         send_keys('Escape')
-        time.sleep(0.4)
-    return capture_raw(), detect_mode(capture_raw())
+        wait_for_change(before=raw, timeout=1.0)
+    raw = capture_raw()
+    return raw, detect_mode(raw)
 
 
 def batch(keys_csv):
-    """Send comma-separated keys with short delays between each."""
-    keys = [k.strip() for k in keys_csv.split(',') if k.strip()]
-    for key in keys:
-        send_keys(key)
-        time.sleep(0.25)
-    time.sleep(0.3)
-    return capture_raw()
+    """Send comma-separated keys with adaptive waits between each."""
+    keys = [key.strip() for key in keys_csv.split(',') if key.strip()]
+    return drive_keys(keys, timeout=1.5)
 
 
 def main():
     args = list(sys.argv[1:])
 
-    # --- raw dump ---
-    if args and args[0] == 'raw':
-        print(capture_raw(), end='')
-        return
+    try:
+        if args and args[0] == 'raw':
+            print(capture_raw(), end='')
+            return
 
-    # --- bail: escape to main menu or game ---
-    if args and args[0] == 'bail':
-        raw, mode = bail()
-        result = parse(raw, mode)
-        result = [l for l in result if not l.startswith('wsl:')]
-        print(f'[{mode}]')
-        for l in result:
-            print(l)
-        return
+        if args and args[0] == 'bail':
+            raw, mode = bail()
+            result = parse(raw, mode)
+            result = [line for line in result if not line.startswith('wsl:')]
+            print(f'[{mode}]')
+            for line in result:
+                print(line)
+            return
 
-    # --- batch: send multiple keys ---
-    if args and args[0] == 'batch' and len(args) > 1:
-        raw = batch(args[1])
+        if args and args[0] == 'batch' and len(args) > 1:
+            raw = batch(args[1])
+            mode = detect_mode(raw)
+            result = parse(raw, mode)
+            result = [line for line in result if not line.startswith('wsl:')]
+            print(f'[{mode}]')
+            for line in result:
+                print(line)
+            return
+
+        if args and args[0] == 'send':
+            send_keys(*args[1:])
+            return
+
+        show_diff = False
+        if args and args[0] == 'diff':
+            show_diff = True
+            args = args[1:]
+
+        prev = load_prev() if show_diff else set()
+
+        if args and args[0] == 'do':
+            raw = drive_keys(args[1:])
+        else:
+            raw = capture_raw()
+
         mode = detect_mode(raw)
         result = parse(raw, mode)
-        result = [l for l in result if not l.startswith('wsl:')]
+        result = [line for line in result if not line.startswith('wsl:')]
+
+        save_capture(result)
+
+        if show_diff:
+            result = [line for line in result if line not in prev]
+
         print(f'[{mode}]')
-        for l in result:
-            print(l)
-        return
-
-    # --- send-only ---
-    if args and args[0] == 'send':
-        send_keys(*args[1:])
-        return
-
-    # --- diff flag ---
-    show_diff = False
-    if args and args[0] == 'diff':
-        show_diff = True
-        args = args[1:]
-
-    # --- load previous capture for diff before anything changes ---
-    prev = load_prev() if show_diff else set()
-
-    # --- do mode: send then adaptive wait ---
-    if args and args[0] == 'do':
-        send_keys(*args[1:])
-        raw = wait_for_change()
-    else:
-        raw = capture_raw()
-
-    mode = detect_mode(raw)
-    result = parse(raw, mode)
-    result = [l for l in result if not l.startswith('wsl:')]
-
-    # --- save for future diffs ---
-    save_capture(result)
-
-    # --- apply diff filter ---
-    if show_diff:
-        result = [l for l in result if l not in prev]
-
-    print(f'[{mode}]')
-    for l in result:
-        print(l)
+        for line in result:
+            print(line)
+    except TmuxError as exc:
+        print(f'tmux error ({SESSION}): {exc}', file=sys.stderr)
+        raise SystemExit(2)
 
 
 if __name__ == '__main__':

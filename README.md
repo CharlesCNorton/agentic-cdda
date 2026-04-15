@@ -20,7 +20,7 @@ A trimmed copy of CDDA with everything removed that isn't needed for terminal ga
 
 ## wrapper.py
 
-Sits between tmux and the caller. Captures the ncurses screen, strips map tiles and minimap, returns only text: status bars, descriptions, menus, dialogue, inventory.
+Sits between tmux and the caller. Captures the ncurses screen, strips map tiles and minimap, returns only text: status bars, descriptions, menus, dialogue, inventory, confirmations, postmortem screens, and bordered popups.
 
 ```
 # Capture current screen as text
@@ -33,20 +33,33 @@ python3 wrapper.py do k
 python3 wrapper.py send Enter
 ```
 
-Detects screen mode automatically (game, look, inventory, dialogue, extended description, surroundings, messages) and routes through the appropriate parser.
+Detects screen mode automatically (game, main menu, look, inventory, dialogue, extended description, surroundings, messages, confirmation prompts, death/postmortem, loading, popups) and routes through the appropriate parser.
+
+## cdda.py
+
+`cdda.py` is the Windows-side launcher for `wrapper.py`. It defaults to the existing WSL flow (`Ubuntu` + `python3` + `/mnt/d/cataclysm-dda/wrapper.py`) but can be redirected without editing the file again.
+
+Environment overrides:
+
+- `CDDA_WRAPPER_MODE=wsl|native`
+- `CDDA_WRAPPER_CMD=<full command>` to bypass the built-in modes entirely
+- `CDDA_WSL_DISTRO`, `CDDA_WSL_PYTHON`, `CDDA_WSL_WRAPPER`
+- `CDDA_NATIVE_PYTHON`, `CDDA_NATIVE_WRAPPER`
+- `CDDA_TMUX_SESSION`, `CDDA_LAST_CAPTURE` forwarded to `wrapper.py`
 
 ## Setup
 
-1. Build the terminal-only binary on Linux:
+1. Have a terminal-only `cataclysm` binary available inside WSL.
    ```
-   make TILES=0 SOUND=0 RELEASE=1 LOCALIZE=1 -j$(nproc)
+   /path/to/cataclysm --version
    ```
-   Or download a `cdda-linux-terminal-only-x64` release from upstream.
+   The tested path for this repo was an existing WSL binary launched from its own build directory. This trimmed checkout contains the wrapper and game source, but it is not documented here as a guaranteed standalone build target.
 
 2. Launch inside tmux:
    ```
-   tmux new-session -d -s cdda -x 80 -y 24 ./cataclysm
+   tmux new-session -d -s cdda -x 80 -y 24 'cd /path/to/cdda && ./cataclysm'
    ```
+   If you use a different session name, set `CDDA_TMUX_SESSION=<name>`.
 
 3. Play through the wrapper:
    ```
