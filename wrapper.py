@@ -4,14 +4,18 @@ CDDA tmux screen parser.
 Strips ASCII map tiles and minimap, preserves all text content.
 
 Usage (from WSL):
-    wrapper.py              # capture screen, parse, print text
-    wrapper.py do KEY...    # send key(s), wait for change, capture+parse
-    wrapper.py send KEY...  # send key(s) only, no capture
-    wrapper.py diff         # capture, show only lines changed since last
-    wrapper.py diff do KEY  # send, wait, capture, show only changes
-    wrapper.py raw          # dump raw tmux pane (for debugging)
-    wrapper.py bail         # hammer Escape until main menu or game screen
-    wrapper.py batch K1,K2  # send comma-separated keys with delays
+    wrapper.py                # capture screen, parse, print text
+    wrapper.py do KEY...      # send key(s), wait for change, capture+parse
+    wrapper.py send KEY...    # send key(s), no capture (small inter-key delay)
+    wrapper.py diff           # capture, show only lines changed since last
+    wrapper.py diff do KEY    # send, wait, capture, show only changes
+    wrapper.py raw            # dump raw tmux pane (for debugging)
+    wrapper.py bail           # hammer Escape until main menu or game screen
+    wrapper.py batch K1,K2    # send comma-separated keys with adaptive waits
+    wrapper.py status         # in chargen, capture DESCRIPTION tab without
+                              #   leaving current tab (auto-tabs there and back)
+    wrapper.py filter TEXT    # in chargen, open filter, type TEXT, commit, then
+                              #   commit selection (handles the two-step Enter)
 """
 import os
 import re
@@ -84,30 +88,113 @@ def capture_raw():
     return run_tmux('capture-pane', '-t', SESSION, '-p').stdout
 
 
-def send_keys(*keys):
+def capture_colored():
+    """Capture pane with ANSI escape codes preserved (-e). Use when you
+    need to know which cells are highlighted/colored — e.g. to detect
+    chargen trait selection state, which CDDA expresses only via color."""
+    return run_tmux('capture-pane', '-t', SESSION, '-e', '-p').stdout
+
+
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+
+
+def strip_ansi(text):
+    return _ANSI_RE.sub('', text)
+
+
+def colored_runs(text):
+    """Yield (color_code, run_text) tuples for a colored string. color_code
+    is the SGR code preceding the run ('' for default/uncolored)."""
+    pos = 0
+    current = ''
+    out = []
+    for m in _ANSI_RE.finditer(text):
+        if m.start() > pos:
+            out.append((current, text[pos:m.start()]))
+        current = m.group(0)
+        pos = m.end()
+    if pos < len(text):
+        out.append((current, text[pos:]))
+    return out
+
+
+# CDDA marks a chargen trait you have selected with bold green. The wrapper
+# uses this to surface trait selection state, which is otherwise invisible
+# to a stripped (uncolored) capture.
+_BOLD_GREEN_RUN = re.compile(r'\x1b\[1m\x1b\[32m([^\x1b\n]+)')
+
+# CDDA also paints the Lifestyle/Knowledge/Offense/Defense/Social ratings in
+# the same bold-green when they're "strong" — these aren't traits and would
+# otherwise pollute the selected-trait list.
+_SUMMARY_RATINGS = frozenset({
+    'weak', 'underpowered', 'average', 'strong', 'overpowered',
+    'fragile', 'sturdy', 'overwhelming',
+})
+
+
+def selected_traits_from_colored(colored_raw):
+    """Names of currently-selected chargen traits, extracted from a colored
+    capture. CDDA renders selected traits in bold green; arrows, scrollbars,
+    and the Summary-bar rating words are filtered out."""
+    seen = set()
+    out = []
+    for text in _BOLD_GREEN_RUN.findall(colored_raw):
+        name = text.strip()
+        if len(name) <= 1 or name in ('^', 'v'):
+            continue
+        if name.lower() in _SUMMARY_RATINGS:
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+def send_keys(*keys, delay_ms=20):
     """Send keys to tmux. Single characters use literal mode (-l) to avoid
-    tmux interpreting ; and other metacharacters."""
+    tmux interpreting ; and other metacharacters. Small inter-key delay
+    avoids races where CDDA hasn't processed the previous key before the
+    next arrives."""
     for key in keys:
         if len(key) == 1:
             run_tmux('send-keys', '-t', SESSION, '-l', key)
         else:
             run_tmux('send-keys', '-t', SESSION, key)
+        if delay_ms:
+            time.sleep(delay_ms / 1000.0)
 
 
-def wait_for_change(before=None, timeout=3.0, interval=0.15):
-    """Poll until the screen content changes or timeout is reached."""
+def wait_for_change(before=None, timeout=3.0, interval=0.15,
+                    settle_ms=200, settle_timeout=1.0):
+    """Poll until the screen content changes, then keep polling until it
+    stabilizes for settle_ms before returning. Prevents the next key in a
+    drive sequence from racing the redraw of the current one."""
     if before is None:
         before = capture_raw()
-    latest = before
     elapsed = 0.0
     while elapsed < timeout:
         time.sleep(interval)
         elapsed += interval
         latest = capture_raw()
         if latest != before:
-            time.sleep(0.1)  # let the screen stabilize
-            return capture_raw()
-    return latest
+            # Wait until screen is stable for settle_ms (no further changes).
+            stable = latest
+            stable_for = 0.0
+            settle_target = settle_ms / 1000.0
+            settle_elapsed = 0.0
+            settle_interval = 0.05
+            while stable_for < settle_target and settle_elapsed < settle_timeout:
+                time.sleep(settle_interval)
+                settle_elapsed += settle_interval
+                cur = capture_raw()
+                if cur == stable:
+                    stable_for += settle_interval
+                else:
+                    stable = cur
+                    stable_for = 0.0
+            return stable
+    return before
 
 
 def drive_keys(keys, timeout=3.0):
@@ -142,13 +229,31 @@ def looks_like_popup(text):
 
 
 def detect_mode(text):
-    # Search dialog overlaid on chargen
+    # Overlays first: a Y/N confirm or specific dialog can sit on top of any
+    # underlying mode (main menu, chargen, game). If we let the structural
+    # checks run first they classify by the visible underlying screen and
+    # the overlay is invisible to the caller.
+    if re.search(r'\[Y\]es\s+\[N\]o', text):
+        return 'confirm'
     if 'Search:' in text and ('SCENARIO' in text or 'PROFESSION' in text):
         return 'chargen_search'
-    # Achievement lock popup
     if 'You must complete the achievement' in text:
         return 'locked'
-    # Character creation
+    if 'Choose a preset character template' in text:
+        return 'popup'
+    if 'Pick a world to enter game' in text or 'World selection' in text:
+        return 'popup'
+
+    # Death / postmortem / loading are also overlay-shaped, check before main
+    # screens since the underlying state may still match.
+    if 'The End' in text and 'In memory of:' in text:
+        return 'death'
+    if 'Your scores' in text and 'ACHIEVEMENTS' in text and 'KILLS' in text:
+        return 'postmortem'
+    if 'Loading files' in text or 'Verifying' in text or 'Finalizing' in text:
+        return 'loading'
+
+    # Structural modes
     if 'SCENARIO' in text and 'PROFESSION' in text and 'STATS' in text:
         if '[TRAITS]' in text:
             return 'chargen_traits'
@@ -181,14 +286,6 @@ def detect_mode(text):
         or ('[New Game]' in text and '[Load]' in text and '[Credits]' in text)
     ):
         return 'main_menu'
-    if re.search(r'\[Y\]es\s+\[N\]o', text):
-        return 'confirm'
-    if 'The End' in text and 'In memory of:' in text:
-        return 'death'
-    if 'Your scores' in text and 'ACHIEVEMENTS' in text and 'KILLS' in text:
-        return 'postmortem'
-    if 'Loading files' in text or 'Verifying' in text or 'Finalizing' in text:
-        return 'loading'
     if looks_like_popup(text):
         return 'popup'
     return 'game'
@@ -379,6 +476,7 @@ def parse_chargen(raw):
     """Two-column chargen view with selection marked in the left column."""
     left, right = [], []
     tabs = ''
+    seen_summary = False
 
     for line in raw.split('\n'):
         r = line.rstrip()
@@ -395,11 +493,16 @@ def parse_chargen(raw):
             continue
 
         if 'Summary |' in r or 'Lifestyle:' in r:
+            seen_summary = True
             left.append(clean_text(r))
             continue
         if '[s] sort' in r or '[f, F' in r:
             continue
         if 'Press ?' in r or 'Press k,' in r or 'Press l,' in r or 'Press TAB' in r:
+            continue
+        # Skip pre-Summary header lines (the chargen meta-title that always
+        # reads "Survivor" regardless of selected scenario/profession).
+        if not seen_summary:
             continue
 
         divider = -1
@@ -456,6 +559,7 @@ def parse_chargen_traits(raw):
     col1, col2, col3 = [], [], []
     description = []
     tabs = ''
+    seen_summary = False
 
     for line in raw.split('\n'):
         r = line.rstrip()
@@ -472,10 +576,12 @@ def parse_chargen_traits(raw):
             continue
 
         if 'Summary' in r and 'Lifestyle' in r:
-            continue
-        if r.strip() == 'Survivor':
+            seen_summary = True
             continue
         if 'sort:' in r or 'filter' in r or 'Press ?' in r:
+            continue
+        # Skip pre-Summary header lines (chargen meta-title "Survivor").
+        if not seen_summary:
             continue
 
         if r.count(BOX_VERT) >= 2:
@@ -753,8 +859,9 @@ def save_capture(lines):
 # ---------------------------------------------------------------------------
 
 def bail():
-    """Hammer Escape until we reach the main menu or game screen.
-    Handles confirmation dialogs and popups along the way."""
+    """Hammer Escape until we reach the main menu or game screen. Y/N
+    confirms get Y. Works from chargen too: Escape opens a "Return to main
+    menu?" confirm which the next iteration answers Y."""
     for _ in range(20):
         raw = capture_raw()
         mode = detect_mode(raw)
@@ -763,10 +870,6 @@ def bail():
         if mode == 'confirm':
             send_keys('Y')
             wait_for_change(before=raw, timeout=1.5)
-            continue
-        if mode in {'chargen_search', 'keybindings', 'locked', 'pause_menu', 'popup', 'postmortem', 'overlay', 'messages'}:
-            send_keys('Escape')
-            wait_for_change(before=raw, timeout=1.0)
             continue
         send_keys('Escape')
         wait_for_change(before=raw, timeout=1.0)
@@ -778,6 +881,93 @@ def batch(keys_csv):
     """Send comma-separated keys with adaptive waits between each."""
     keys = [key.strip() for key in keys_csv.split(',') if key.strip()]
     return drive_keys(keys, timeout=1.5)
+
+
+CHARGEN_TABS = (
+    'SCENARIO', 'PROFESSION', 'BACKGROUND',
+    'STATS', 'TRAITS', 'SKILLS', 'DESCRIPTION',
+)
+
+
+def detect_chargen_tab(raw):
+    """Active chargen tab from the < │NAME│ > markers in the tab row."""
+    for tab in CHARGEN_TABS:
+        if f'<{BOX_VERT}{tab}{BOX_VERT}>' in raw:
+            return tab
+    return None
+
+
+def chargen_status():
+    """Tab to DESCRIPTION, capture, and tab back to the originating tab.
+    Also probes TRAITS for selection state (CDDA color-marks selected
+    traits but doesn't list them on the description tab unless the pane
+    is wide enough). Returns the parsed lines plus a selected-traits
+    section. Caller must already be in chargen mode."""
+    raw = capture_raw()
+    mode = detect_mode(raw)
+    if not mode.startswith('chargen'):
+        raise RuntimeError(f'not in chargen (current mode: {mode})')
+
+    current = detect_chargen_tab(raw)
+    if current is None:
+        raise RuntimeError('could not detect current chargen tab')
+
+    def go_to(target):
+        """Walk Tab/BTab toward target without wrapping past DESCRIPTION (which
+        triggers a "Are you SURE you're finished?" finalize confirm) or past
+        SCENARIO (which goes nowhere)."""
+        target_idx = CHARGEN_TABS.index(target)
+        while True:
+            now = detect_chargen_tab(capture_raw()) or current
+            now_idx = CHARGEN_TABS.index(now)
+            if now_idx == target_idx:
+                return
+            if now_idx < target_idx:
+                send_keys('Tab')
+            else:
+                send_keys('BTab')
+            wait_for_change(timeout=1.0)
+
+    # Probe DESCRIPTION
+    go_to('DESCRIPTION')
+    desc_raw = capture_raw()
+    desc_mode = detect_mode(desc_raw)
+    desc_lines = parse(desc_raw, desc_mode)
+
+    # Probe TRAITS for color-encoded selection state
+    go_to('TRAITS')
+    traits_colored = capture_colored()
+    selected = selected_traits_from_colored(traits_colored)
+
+    # Return to originating tab
+    go_to(current)
+
+    out = list(desc_lines)
+    if selected:
+        out.append('')
+        out.append('Selected traits: ' + ', '.join(selected))
+    return out
+
+
+def chargen_filter(text):
+    """Open chargen list filter, type text, commit the filter, then commit
+    the selection. CDDA's filter Enter only closes the search dialog and
+    does not commit the highlighted item; a second Enter is needed.
+    Returns the post-commit raw screen."""
+    raw = capture_raw()
+    mode = detect_mode(raw)
+    if not mode.startswith('chargen'):
+        raise RuntimeError(f'not in chargen (current mode: {mode})')
+
+    send_keys('f')
+    wait_for_change(before=raw, timeout=2.0)
+    for ch in text:
+        send_keys(ch)
+    send_keys('Enter')
+    raw = wait_for_change(timeout=2.0)
+    send_keys('Enter')
+    raw = wait_for_change(timeout=2.0)
+    return raw
 
 
 def main():
@@ -799,6 +989,24 @@ def main():
 
         if args and args[0] == 'batch' and len(args) > 1:
             raw = batch(args[1])
+            mode = detect_mode(raw)
+            result = parse(raw, mode)
+            result = [line for line in result if not line.startswith('wsl:')]
+            print(f'[{mode}]')
+            for line in result:
+                print(line)
+            return
+
+        if args and args[0] == 'status':
+            lines = chargen_status()
+            lines = [line for line in lines if not line.startswith('wsl:')]
+            print('[chargen status]')
+            for line in lines:
+                print(line)
+            return
+
+        if args and args[0] == 'filter' and len(args) > 1:
+            raw = chargen_filter(args[1])
             mode = detect_mode(raw)
             result = parse(raw, mode)
             result = [line for line in result if not line.startswith('wsl:')]
