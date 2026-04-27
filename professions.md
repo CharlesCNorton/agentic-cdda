@@ -97,7 +97,7 @@ This seemed like a great place for a acation, but you're starting to regret ever
 You were always an inexplicable sight in town, with your funny hair and odd Japanese clothes.  Little of this concerned you, but last week the grocery service stopped coming and now the TV no longer turns on.  This displeases you.
 
 ### Tourist Swimmer
-You were looking forward to a nice, relaxing day at the beach.  You had to run when some lunatics tried to rip your head off and play beach olleyball with it, but at least you managed to grab your bag on the way out.
+You were looking forward to a nice, relaxing day at the beach.  You had to run when some lunatics tried to rip your head off and play beach volleyball with it, but at least you managed to grab your bag on the way out.
 
 ### Office Worker
 
@@ -306,7 +306,7 @@ You were exploring below the waves close to shore when you noticed something wei
 You've always admired the beauty of urban desolation, and were ready for your next excursion when the end of the world hit.  You suppose that pretty much every building could be considered abandoned now.
 
 ### Lab Technician
-Thanks to years of study and hard work in the lab, you're familiar with the basics of scientific inquiry.  Only one question remains: can you undo the ery Cataclysm your colleagues helped create?
+Thanks to years of study and hard work in the lab, you're familiar with the basics of scientific inquiry.  Only one question remains: can you undo the very Cataclysm your colleagues helped create?
 
 ### Football Player
 Your epic touchdown was ruined when your coach's guts were torn out by undead fans.  Now you're first pick in the apocalypse draft.

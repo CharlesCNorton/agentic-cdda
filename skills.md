@@ -95,6 +95,3 @@ Your skill in surviving the wilderness, and in crafting various basic survival i
 ### piercing weapons
 Your skill in fighting with knives, spears and other such stabbing implements.  Skill increases attack accuracy as well as the chance of inflicting a deadly and critical blow.
 
-### weapon
-seeing this is a bug
-

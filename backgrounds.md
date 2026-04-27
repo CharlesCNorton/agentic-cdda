@@ -8,7 +8,6 @@ You got your driving license and know how to drive a car, change the oil and tir
 ### Simple Home Cooking
 You've been living on your own long enough that you know how to cook basic dishes and feed yourself.
 **Skills:** food handling (beginner)
-**Proficiencies:** wsl: Processing /etc/fstab with mount -a failed.
 
 ### Computer Literate
 Either through school, your job, or from your family, you've learned the basics of how to use a computer.
@@ -33,14 +32,14 @@ You love reading, but you never seemed to have enough time.  Maybe the Cataclysm
 You can swim.  Probably not very well, and you won't break any speed records, but, you CAN swim.
 
 ### Video Gaming
-You loved immersing yourself in irtual worlds through video games. Now you're faced with real survival horror, and no extra lives.
+You loved immersing yourself in virtual worlds through video games. Now you're faced with real survival horror, and no extra lives.
 **Traits:** Less Sleep
 
 ### Cooking (Beginner)
 You can cook well enough that you didn't have to live on instant noodles and takeout, but you've only really learned the bare minimum.
 
 ### Public Speaking
-You are an incredibly social individual, with the projection and ocabulary to make people listen.
+You are an incredibly social individual, with the projection and vocabulary to make people listen.
 **Traits:** Booming Voice
 
 ### Motorsports
@@ -62,10 +61,9 @@ You've got training and some experience in dealing with urgent injuries.  In the
 ### Backyard Grilling
 You enjoyed inviting the neighborhood to a backyard cookout on the weekends. You, of course, were the grill master.
 **Skills:** food handling (intermediate)
-**Proficiencies:** wsl: Processing /etc/fstab with mount -a failed.
 
 ### Fishing
-A quiet day at the lake would be a welcome break from the hordes. Though, now that you think about it, the fish have been acting strangely icious lately too.
+A quiet day at the lake would be a welcome break from the hordes. Though, now that you think about it, the fish have been acting strangely vicious lately too.
 **Traits:** Outdoorsman
 
 ### Sports Coaching
@@ -77,7 +75,6 @@ Your green thumb will come in handy when the grocery stores are overrun.
 ### Ropemaking
 Your knots are strong, whether they're made from cloth or natural cordage.
 **Skills:** survival (beginner), tailoring (beginner)
-**Proficiencies:** wsl: Processing /etc/fstab with mount -a failed.
 
 ### Moshing
 You went to loud concerts and spent your time in the mosh pits.  Now that everything's gone to hell, the whole world is your mosh pit.
@@ -118,7 +115,6 @@ The art of producing the finest quality cheeses has been passed down through you
 ### Knife Throwing
 You learned how to throw knives before the world ended, a skill that can be deadly in the right situation.
 **Skills:** throwing (competent)
-**Proficiencies:** wsl: Processing /etc/fstab with mount -a failed.
 
 ### Fine Dining
 You loved going to all kinds of restaurants and experiencing everything the world of culinary arts had to offer.  Nowadays, those chefs are all dead, so it'll be up to you to recreate the joys of your past.
@@ -164,7 +160,6 @@ You loved the smell of gunsmoke and blowing ceramic discs out of the sky. Your f
 ### Carpentry
 With enough time and materials, you could make a boat from scratch.  These undead can't swim, right?
 **Skills:** fabrication (competent)
-**Proficiencies:** wsl: Processing /etc/fstab with mount -a failed.
 
 ### Machinist (Beginner)
 You can cut metal, and drill holes without snapping your tools in the process.  At least the undead don't care about quality control.
@@ -172,7 +167,7 @@ You can cut metal, and drill holes without snapping your tools in the process.  
 ### Deep Frying
 You'd have been a hit at the county fair, but you're cooking for one now.
 **Skills:** food handling (competent)
-**Proficiencies:** Principles of Frying: Anyone can toss, wsl: Processing /etc/fstab with mount -a failed.
+**Proficiencies:** Principles of Frying: Anyone can toss
 
 ### Homebrewing
 Your white lightning could knock out an elephant, but you're drinking alone now.

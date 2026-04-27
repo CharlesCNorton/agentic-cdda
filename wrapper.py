@@ -199,7 +199,15 @@ def detect_mode(text):
 # ---------------------------------------------------------------------------
 
 def clean_text(text, extra_strip=''):
-    return text.strip(BORDER + extra_strip + ' ').strip()
+    text = text.strip(BORDER + ' ')
+    if extra_strip:
+        chars = '[' + re.escape(extra_strip) + ']'
+        # Strip a leading isolated extra (e.g. compass arrow at start of a message
+        # row). Trailing extras are left for _rejoin_wrapped to handle, since a
+        # trailing single letter may be a word fragment from a line wrap.
+        text = re.sub(r'^' + chars + r'(?=\s|$)', '', text)
+        text = text.strip()
+    return text
 
 
 def trim_status_tail(text):
@@ -340,7 +348,18 @@ def _rejoin_wrapped(lines):
         return lines
     out = [lines[0]]
     for line in lines[1:]:
-        if line and (line[0].islower() or line[0] in ',.;:!?)\'"'):
+        if not line:
+            continue
+        prev = out[-1]
+        # Mid-word wrap: prev ends with a space + single letter (the start of a
+        # word that got broken by ncurses line wrap) and the next line begins
+        # with a lowercase letter. Concatenate without inserting a space so
+        # "strangely v" + "icious lately" becomes "strangely vicious lately".
+        if (len(prev) >= 2 and prev[-2] == ' '
+                and prev[-1].isalpha()
+                and line[0].islower()):
+            out[-1] = prev + line
+        elif line[0].islower() or line[0] in ',.;:!?)\'"':
             out[-1] += ' ' + line
         else:
             out.append(line)
