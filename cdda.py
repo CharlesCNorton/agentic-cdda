@@ -404,7 +404,8 @@ def main():
     skip_map = {'bail', 'raw', 'status', 'filter', 'trait_select',
                 'trait_state', 'parse_fixture',
                 'pickup', 'examine', 'consume', 'sleep', 'wait',
-                'character', 'keys'}
+                'character', 'keys',
+                'set_stats', 'set_name', 'finalize'}
     if args and args[0].lower() in skip_map:
         pass
     elif args and args[0].lower() == 'batch':

@@ -1056,12 +1056,15 @@ def chargen_status():
 
 
 def chargen_filter(text):
-    """Open chargen list filter, type text, commit. The first Enter closes
-    the search dialog and lands the cursor on the first match. In tabs that
-    expect a second confirmation (PROFESSION/SCENARIO/BACKGROUND/SKILLS)
-    a second Enter is sent. In TRAITS, where Enter toggles the trait under
-    cursor, the second Enter is suppressed so the filter does not toggle
-    the wrong trait."""
+    """Open chargen list filter, type text, commit with a single Enter.
+    The single Enter both closes the search dialog and lands the cursor on
+    the first match — and on SCENARIO/PROFESSION/BACKGROUND/SKILLS the
+    cursor row IS the selection. Earlier versions sent a second Enter on
+    those tabs assuming it was needed to "confirm"; in practice it could
+    shift the cursor to the next row (silently swapping the selected
+    scenario right before finalize) or fire a stray toggle. For TRAITS,
+    Enter toggles, so callers should use trait_select() which handles
+    toggling explicitly."""
     raw = capture_raw()
     mode = detect_mode(raw)
     if not mode.startswith('chargen'):
@@ -1072,11 +1075,7 @@ def chargen_filter(text):
     for ch in text:
         send_keys(ch)
     send_keys('Enter')
-    raw = wait_for_change(timeout=2.0)
-    if mode != 'chargen_traits':
-        send_keys('Enter')
-        raw = wait_for_change(timeout=2.0)
-    return raw
+    return wait_for_change(timeout=2.0)
 
 
 def chargen_filter_reset():
@@ -1084,6 +1083,124 @@ def chargen_filter_reset():
     raw = capture_raw()
     send_keys('r')
     return wait_for_change(before=raw, timeout=1.0)
+
+
+def _dismiss_chargen_popup():
+    """Dismiss a 'Nothing found.' popup (or similar transient dialog) sitting
+    on top of the chargen list. Escape clears it; if Escape changes nothing
+    we fall back to Enter, which some popups want as acknowledgement."""
+    raw = capture_raw()
+    send_keys('Escape')
+    after = wait_for_change(before=raw, timeout=0.6)
+    if after == raw:
+        send_keys('Enter')
+        wait_for_change(timeout=0.6)
+
+
+def _go_to_chargen_tab(target):
+    """Walk Tab/BTab to a target chargen tab without overshooting past
+    DESCRIPTION (which would trigger the finalize confirm). Returns True
+    on success, False if the active tab couldn't be detected."""
+    target_idx = CHARGEN_TABS.index(target)
+    for _ in range(len(CHARGEN_TABS) * 2):
+        now = detect_chargen_tab(capture_raw())
+        if now is None:
+            return False
+        now_idx = CHARGEN_TABS.index(now)
+        if now_idx == target_idx:
+            return True
+        if now_idx < target_idx:
+            send_keys('Tab')
+        else:
+            send_keys('BTab')
+        wait_for_change(timeout=1.0)
+    return False
+
+
+CHARGEN_STAT_NAMES = ('Strength', 'Dexterity', 'Intelligence', 'Perception')
+
+
+def _read_stat_value(stat_name):
+    text = strip_ansi(capture_raw())
+    m = re.search(rf'{re.escape(stat_name)}:\s+(\d+)', text)
+    return int(m.group(1)) if m else None
+
+
+def chargen_set_stats(values):
+    """Set chargen stats to target values. `values` is a dict keyed by
+    'str'/'dex'/'int'/'per' (any subset). Tabs to STATS first if needed,
+    walks the cursor to each stat row, and adjusts via Left/Right with
+    a value re-read after each press so a dropped key doesn't desync the
+    counter. Returns the post-set values for verification."""
+    if not _go_to_chargen_tab('STATS'):
+        raise RuntimeError('could not navigate to STATS tab')
+
+    # Slam the cursor to the top of the stat list.
+    for _ in range(len(CHARGEN_STAT_NAMES) + 2):
+        send_keys('Up')
+        time.sleep(0.05)
+
+    actual = {}
+    for idx, stat_name in enumerate(CHARGEN_STAT_NAMES):
+        if idx > 0:
+            send_keys('Down')
+            time.sleep(0.12)
+        key = stat_name.lower()[:3]
+        actual[key] = _read_stat_value(stat_name)
+        if key not in values:
+            continue
+        target = int(values[key])
+        for _ in range(20):
+            cur = _read_stat_value(stat_name)
+            if cur is None or cur == target:
+                break
+            send_keys('Right' if cur < target else 'Left')
+            time.sleep(0.18)
+        actual[key] = _read_stat_value(stat_name)
+    return actual
+
+
+def chargen_set_name(name):
+    """On DESCRIPTION tab, edit the Name field to a literal string. The
+    cursor lands on Name by default when entering DESCRIPTION; Enter opens
+    the input popup, the literal text is typed, and Enter commits."""
+    if not _go_to_chargen_tab('DESCRIPTION'):
+        raise RuntimeError('could not navigate to DESCRIPTION tab')
+    raw = capture_raw()
+    send_keys('Enter')
+    wait_for_change(before=raw, timeout=1.0)
+    for ch in name:
+        send_keys(ch)
+        time.sleep(0.04)
+    send_keys('Enter')
+    wait_for_change(timeout=1.0)
+    text = strip_ansi(capture_raw())
+    m = re.search(r'Name:\s+([^\n]+?)\s{2,}', text)
+    return {'name': m.group(1).strip() if m else None}
+
+
+def chargen_finalize(expected_scenario=None):
+    """Walk to DESCRIPTION (re-asserting the scenario en route if requested,
+    so a cursor that drifted off the intended scenario gets pulled back)
+    and Tab past DESCRIPTION to trigger the finalize confirm. Y commits.
+    Returns the post-finalize mode so callers can confirm spawn."""
+    if expected_scenario:
+        if not _go_to_chargen_tab('SCENARIO'):
+            raise RuntimeError('could not navigate to SCENARIO tab')
+        chargen_filter_reset()
+        chargen_filter(expected_scenario)
+
+    if not _go_to_chargen_tab('DESCRIPTION'):
+        raise RuntimeError('could not navigate to DESCRIPTION tab')
+
+    send_keys('Tab')
+    raw = wait_for_change(timeout=2.0)
+    mode = detect_mode(raw)
+    if mode != 'confirm':
+        return {'ok': False, 'mode': mode, 'reason': 'no finalize confirm appeared'}
+    send_keys('Y')
+    raw = wait_for_change(timeout=10.0)
+    return {'ok': True, 'mode': detect_mode(raw)}
 
 
 def trait_state():
@@ -1118,9 +1235,11 @@ def trait_select(name):
 
     chargen_filter_reset()
 
-    # Try the current pane first, then pan right and retry. Two panes max
-    # for the trait list (positive + negative); skip the cosmetic pane.
-    for attempt in range(2):
+    # Try the current pane first, then pan right and retry. Three attempts
+    # cover positive + negative + cosmetic; the cosmetic pane has no real
+    # toggles so it short-circuits, but visiting it still rotates back to a
+    # useful pane on the next pass.
+    for attempt in range(3):
         send_keys('f')
         wait_for_change(timeout=1.0)
         for ch in name:
@@ -1128,9 +1247,20 @@ def trait_select(name):
         send_keys('Enter')
         raw = wait_for_change(timeout=1.0)
 
-        # Check if the name appears in the (now-filtered) plain capture.
-        # If filter matched in this pane, exactly one row containing the
-        # name will be present. If no match, the pane is empty / unchanged.
+        # If the filter found nothing, CDDA pops a "Nothing found." dialog
+        # on top of the list. Older versions left it sitting, so subsequent
+        # 'r'/Right/'f' keys went into the popup and corrupted the cosmetic
+        # pane filter (where stray characters showed up as one-letter rows
+        # like 'Facial hair: n'). Dismiss before continuing.
+        if 'Nothing found' in strip_ansi(raw):
+            _dismiss_chargen_popup()
+            chargen_filter_reset()
+            send_keys('Right')
+            wait_for_change(timeout=0.5)
+            continue
+
+        # Filter committed. Cursor lands on first match — if the name shows
+        # up in the visible plain capture, toggle it.
         if name in strip_ansi(raw):
             send_keys('Enter')  # toggle
             wait_for_change(timeout=1.0)
@@ -1153,7 +1283,8 @@ def trait_select(name):
                 'ok': was_selected != after_selected,
             }
 
-        # No match in this pane. Reset and pan right.
+        # Filter committed but the name isn't on screen — match was probably
+        # in a different pane. Reset and pan.
         chargen_filter_reset()
         send_keys('Right')
         wait_for_change(timeout=0.5)
@@ -1604,6 +1735,37 @@ def main():
                 print('[trait_state]')
                 print('positive: ' + (', '.join(panes['positive']) or '(none)'))
                 print('negative: ' + (', '.join(panes['negative']) or '(none)'))
+            return
+
+        if args and args[0] == 'set_stats' and len(args) >= 5:
+            values = {'str': int(args[1]), 'dex': int(args[2]),
+                      'int': int(args[3]), 'per': int(args[4])}
+            actual = chargen_set_stats(values)
+            if as_json:
+                print(json.dumps(actual, ensure_ascii=False))
+            else:
+                print('[set_stats]')
+                for k in ('str', 'dex', 'int', 'per'):
+                    print(f'{k}: {actual.get(k)}')
+            return
+
+        if args and args[0] == 'set_name' and len(args) > 1:
+            outcome = chargen_set_name(args[1])
+            if as_json:
+                print(json.dumps(outcome, ensure_ascii=False))
+            else:
+                print(f'[set_name] {outcome.get("name")!r}')
+            return
+
+        if args and args[0] == 'finalize':
+            scenario = args[1] if len(args) > 1 else None
+            outcome = chargen_finalize(expected_scenario=scenario)
+            if as_json:
+                print(json.dumps(outcome, ensure_ascii=False))
+            else:
+                print(f'[finalize] ok={outcome.get("ok")} mode={outcome.get("mode")}')
+                if outcome.get('reason'):
+                    print(outcome['reason'])
             return
 
         if args and args[0] == 'parse_fixture' and len(args) > 1:
