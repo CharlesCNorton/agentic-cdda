@@ -1,2 +1,5 @@
 #!/bin/bash
-exec /c/Python313/python.exe "D:/cataclysm-dda/cdda.py" "$@"
+# Bash shim for cdda.py. Resolves cdda.py from this script's own directory
+# so the repo can be moved or renamed without editing this file.
+DIR="$(cd "$(dirname "$(readlink -f "$0" || echo "$0")")" && pwd)"
+exec /c/Python313/python.exe "$DIR/cdda.py" "$@"

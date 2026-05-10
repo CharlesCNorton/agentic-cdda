@@ -17,14 +17,21 @@ Usage:
     cdda.py back                # context-aware back (BTab or Escape)
     cdda.py status              # in chargen, show DESCRIPTION tab content
                                 # (auto tabs there and back)
-    cdda.py filter "Trivia"     # in chargen, filter list and commit selection
+    cdda.py filter "Trivia"     # in chargen, filter list and commit
+    cdda.py trait_select Asthmatic  # in chargen TRAITS, find + toggle a trait
+    cdda.py trait_state         # dump selected positive/negative traits
+    cdda.py doctor              # check WSL distro + tmux + python + wrapper
+
+Add --json before any subcommand to get a structured response.
 
 Environment:
     CDDA_WRAPPER_MODE   wsl | native (default: wsl)
     CDDA_WRAPPER_CMD    Full command override for launching wrapper.py
-    CDDA_WSL_DISTRO     WSL distro name (default: Ubuntu)
+    CDDA_WSL_DISTRO     WSL distro name (default: auto-detect; falls back to
+                        Ubuntu, WSLExperiments, then any running distro)
     CDDA_WSL_PYTHON     Python inside WSL (default: python3)
-    CDDA_WSL_WRAPPER    Wrapper path inside WSL
+    CDDA_WSL_WRAPPER    Wrapper path inside WSL (default: derived from this
+                        script's location, e.g. /mnt/d/agentic-cdda/wrapper.py)
     CDDA_NATIVE_PYTHON  Native Python executable (default: current interpreter)
     CDDA_NATIVE_WRAPPER Native wrapper.py path (default: repo-local wrapper.py)
     CDDA_TMUX_SESSION   Forwarded to wrapper.py
@@ -38,7 +45,7 @@ Daemon mode (skip wsl.exe spawn cost per call):
     CDDA_DAEMON_TIMEOUT Connect timeout in seconds (default: 0.3)
 
     Start the daemon manually inside WSL:
-        wsl -d <distro> -- python3 /mnt/d/cataclysm-dda/wrapper_daemon.py
+        wsl -d <distro> -- python3 /mnt/d/<repo>/wrapper_daemon.py
 """
 import json
 import os
@@ -204,6 +211,71 @@ def write_text(stream, text):
     stream.flush()
 
 
+def windows_to_wsl_path(p):
+    """Translate D:\\agentic-cdda\\wrapper.py -> /mnt/d/agentic-cdda/wrapper.py."""
+    p = Path(p).resolve()
+    parts = p.parts
+    if not parts:
+        return str(p)
+    drive = parts[0].rstrip(':\\').rstrip(':').lower()
+    if not drive:
+        return str(p).replace('\\', '/')
+    rest = '/'.join(parts[1:]).replace('\\', '/')
+    return f'/mnt/{drive}/{rest}'
+
+
+def derived_wsl_wrapper():
+    """Default wrapper path inside WSL: this script's sibling wrapper.py
+    translated to /mnt/<drive>/... form. Replaces the prior hardcoded
+    /mnt/d/cataclysm-dda/wrapper.py default."""
+    here = Path(__file__).with_name('wrapper.py')
+    return windows_to_wsl_path(here)
+
+
+def list_running_wsl_distros():
+    """Return list of currently-running WSL distro names. Empty on failure.
+
+    wsl.exe emits UTF-16 LE on Windows (with a BOM), and Python's text= mode
+    treats it as Latin-1, splicing null bytes into every character. We must
+    consume bytes and decode explicitly."""
+    try:
+        out = subprocess.run(
+            ['wsl.exe', '--list', '--running', '--quiet'],
+            capture_output=True, timeout=4,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return []
+    if out.returncode != 0:
+        return []
+    raw = out.stdout
+    # Strip a UTF-16 LE BOM if present, then decode.
+    if raw.startswith(b'\xff\xfe'):
+        raw = raw[2:]
+    try:
+        text = raw.decode('utf-16-le')
+    except UnicodeDecodeError:
+        text = raw.decode('utf-8', errors='replace')
+    # Some versions emit \r\n separators with stray \x00s; clean them up.
+    text = text.replace('\x00', '').replace('\r', '')
+    distros = [line.strip() for line in text.split('\n') if line.strip()]
+    return distros
+
+
+def auto_detect_distro():
+    """Pick a WSL distro to use. Order: env override > Ubuntu (if running) >
+    WSLExperiments > first running distro > Ubuntu (fallback)."""
+    override = os.environ.get('CDDA_WSL_DISTRO', '').strip()
+    if override:
+        return override
+    running = list_running_wsl_distros()
+    for preferred in ('Ubuntu', 'WSLExperiments'):
+        if preferred in running:
+            return preferred
+    if running:
+        return running[0]
+    return 'Ubuntu'
+
+
 def get_wrapper_command():
     custom_cmd = os.environ.get('CDDA_WRAPPER_CMD', '').strip()
     if custom_cmd:
@@ -222,12 +294,9 @@ def get_wrapper_command():
         return [native_python, native_wrapper]
 
     if mode == 'wsl':
-        distro = os.environ.get('CDDA_WSL_DISTRO', 'Ubuntu')
+        distro = auto_detect_distro()
         wsl_python = os.environ.get('CDDA_WSL_PYTHON', 'python3')
-        wsl_wrapper = os.environ.get(
-            'CDDA_WSL_WRAPPER',
-            '/mnt/d/cataclysm-dda/wrapper.py',
-        )
+        wsl_wrapper = os.environ.get('CDDA_WSL_WRAPPER', derived_wsl_wrapper())
         forwarded = [
             f'{name}={os.environ[name]}'
             for name in FORWARDED_ENV_VARS
@@ -244,8 +313,78 @@ def get_wrapper_command():
 
     raise SystemExit(f'Unsupported CDDA_WRAPPER_MODE: {mode!r}')
 
+def doctor():
+    """Check the local environment that cdda.py / wrapper.py depend on.
+    Prints PASS/FAIL lines with fix hints. Returns exit code (0 on all
+    pass, 1 on any failure)."""
+    failures = 0
+
+    def check(label, ok, detail=''):
+        nonlocal failures
+        mark = 'PASS' if ok else 'FAIL'
+        line = f'[{mark}] {label}'
+        if detail:
+            line += f'  ({detail})'
+        print(line)
+        if not ok:
+            failures += 1
+
+    distro = auto_detect_distro()
+    running = list_running_wsl_distros()
+    distro_running = distro in running
+    check(
+        f'WSL distro {distro!r} reachable',
+        distro_running,
+        'override with CDDA_WSL_DISTRO=...; running: ' + (', '.join(running) or '(none)'),
+    )
+
+    if distro_running:
+        for tool in ('tmux', 'python3'):
+            res = subprocess.run(
+                ['wsl.exe', '-d', distro, '--', 'bash', '-lc', f'command -v {tool}'],
+                capture_output=True, text=True, timeout=4,
+            )
+            check(
+                f'{tool} present in {distro}',
+                res.returncode == 0 and res.stdout.strip(),
+                res.stdout.strip() or 'install it inside the distro',
+            )
+
+        wrapper_path = os.environ.get('CDDA_WSL_WRAPPER', derived_wsl_wrapper())
+        res = subprocess.run(
+            ['wsl.exe', '-d', distro, '--', 'bash', '-lc', f'test -f {shlex.quote(wrapper_path)}'],
+            capture_output=True, timeout=4,
+        )
+        check(f'wrapper.py at {wrapper_path}', res.returncode == 0,
+              'set CDDA_WSL_WRAPPER if your repo lives elsewhere')
+
+    session = os.environ.get('CDDA_TMUX_SESSION', 'cdda')
+    if distro_running:
+        res = subprocess.run(
+            ['wsl.exe', '-d', distro, '--', 'tmux', 'has-session', '-t', session],
+            capture_output=True, timeout=4,
+        )
+        if res.returncode == 0:
+            check(f'tmux session {session!r} exists', True)
+        else:
+            print(f'[INFO] tmux session {session!r} not found — start CDDA first')
+
+    return 1 if failures else 0
+
+
 def main():
     args = list(sys.argv[1:])
+
+    # 'doctor' is local — does not call into the wrapper.
+    if args and args[0].lower() == 'doctor':
+        raise SystemExit(doctor())
+
+    # Pull --json off the front so it survives unchanged through key mapping
+    # and gets passed straight to wrapper.py.
+    json_flag = []
+    if args and args[0] in ('--json', '-j'):
+        json_flag = [args[0]]
+        args = args[1:]
 
     # 'back' is a synthetic command: send BTab (chargen back-tab)
     if args and args[0].lower() == 'back':
@@ -259,9 +398,13 @@ def main():
             return NAMED_KEY_MAP[lower]
         return token
 
-    # Don't map keys for commands that take string args
-    # (batch / filter / status / bail / raw)
-    skip_map = {'bail', 'raw', 'status', 'filter'}
+    # Don't map keys for commands that take string args (or no args). All
+    # gameplay-action subcommands belong here too — pickup/examine/sleep/wait/
+    # consume take a NAME or duration spec, not a CDDA keystroke.
+    skip_map = {'bail', 'raw', 'status', 'filter', 'trait_select',
+                'trait_state', 'parse_fixture',
+                'pickup', 'examine', 'consume', 'sleep', 'wait',
+                'character', 'keys'}
     if args and args[0].lower() in skip_map:
         pass
     elif args and args[0].lower() == 'batch':
@@ -275,7 +418,10 @@ def main():
         args = [map_one(a) for a in args]
 
     # Try daemon first if enabled. Falls back to subprocess if not reachable.
-    if daemon_enabled():
+    # The daemon already speaks JSON natively, so --json over daemon is a
+    # no-op (the existing emit_daemon_response prints prose; JSON over daemon
+    # would need a separate code path which is not yet implemented).
+    if daemon_enabled() and not json_flag:
         req = args_to_daemon_request(args)
         if req is not None:
             resp = daemon_call(req)
@@ -283,7 +429,17 @@ def main():
                 emit_daemon_response(resp)
                 return
 
-    cmd = get_wrapper_command() + args
+    base_cmd = get_wrapper_command()
+    is_wsl = base_cmd and 'wsl.exe' in base_cmd[0].lower()
+    if is_wsl:
+        # wsl.exe -- ... joins everything after `--` into one string and runs
+        # it through bash, which then interprets shell metachars (`<`, `>`,
+        # `;`, `&`, etc.) in the user's args. Pre-quote so `cdda.py do <`
+        # (lowercase 'less' mapped to literal '<') doesn't trip bash.
+        forwarded_args = [shlex.quote(a) for a in (json_flag + args)]
+    else:
+        forwarded_args = json_flag + args
+    cmd = base_cmd + forwarded_args
 
     run_env = os.environ.copy()
     run_env.setdefault('PYTHONIOENCODING', 'utf-8')
