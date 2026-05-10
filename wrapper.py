@@ -1056,15 +1056,16 @@ def chargen_status():
 
 
 def chargen_filter(text):
-    """Open chargen list filter, type text, commit with a single Enter.
-    The single Enter both closes the search dialog and lands the cursor on
-    the first match — and on SCENARIO/PROFESSION/BACKGROUND/SKILLS the
-    cursor row IS the selection. Earlier versions sent a second Enter on
-    those tabs assuming it was needed to "confirm"; in practice it could
-    shift the cursor to the next row (silently swapping the selected
-    scenario right before finalize) or fire a stray toggle. For TRAITS,
-    Enter toggles, so callers should use trait_select() which handles
-    toggling explicitly."""
+    """Open chargen list filter, type text, commit. On non-TRAITS tabs we
+    send TWO Enters: the first closes the filter dialog and lands the cursor
+    on the first match; the second is the CONFIRM action that
+    src/newcharacter.cpp handles as `reset_scenario()` (or the equivalent
+    for the active tab) and is what actually persists the selection into
+    spawn-side state. The cursor moving to a row is just visual hover —
+    without the second Enter the spawn keeps using the previously committed
+    selection, typically the default (Evacuee + Survivor). For TRAITS,
+    Enter toggles, so we suppress the second Enter; callers use
+    trait_select() which handles toggling explicitly."""
     raw = capture_raw()
     mode = detect_mode(raw)
     if not mode.startswith('chargen'):
@@ -1075,7 +1076,11 @@ def chargen_filter(text):
     for ch in text:
         send_keys(ch)
     send_keys('Enter')
-    return wait_for_change(timeout=2.0)
+    raw = wait_for_change(timeout=2.0)
+    if mode != 'chargen_traits':
+        send_keys('Enter')
+        raw = wait_for_change(timeout=2.0)
+    return raw
 
 
 def chargen_filter_reset():
@@ -1197,25 +1202,17 @@ def chargen_set_name(name):
 
 def chargen_finalize(expected_scenario=None, expected_profession=None, verify=True):
     """Walk to DESCRIPTION and Tab past it to trigger the finalize confirm.
-    If `expected_scenario` and/or `expected_profession` are given, re-filter
-    them in (profession first, scenario last so SCENARIO is the most-recently-
-    touched tab — empirically the chargen state for SCENARIO is the most
-    fragile and easiest to revert by intermediate cursor work). When
-    `verify` is True (default), parse the DESCRIPTION tab for the expected
-    names; if they're missing, return ok=False with a reason instead of
-    finalizing into a wrong build."""
-    if expected_profession:
-        if not _go_to_chargen_tab('PROFESSION'):
-            raise RuntimeError('could not navigate to PROFESSION tab')
-        chargen_filter_reset()
-        chargen_filter(expected_profession)
+    Does NOT re-filter scenario or profession on the way: src/newcharacter.cpp
+    `reset_scenario` cascade-resets the selected profession (and stats and
+    traits) when a new scenario is committed, so re-asserting scenario at
+    finalize time would silently wipe whatever profession the caller had
+    already set. Caller must set scenario FIRST, then profession, then
+    stats, then traits, then name — in that order — so each commit doesn't
+    cascade-reset the next.
 
-    if expected_scenario:
-        if not _go_to_chargen_tab('SCENARIO'):
-            raise RuntimeError('could not navigate to SCENARIO tab')
-        chargen_filter_reset()
-        chargen_filter(expected_scenario)
-
+    With `verify` (default), the expected names are looked for in the
+    DESCRIPTION dump before pressing past it; mismatches return ok=False
+    with a reason instead of finalizing into a wrong build."""
     if not _go_to_chargen_tab('DESCRIPTION'):
         raise RuntimeError('could not navigate to DESCRIPTION tab')
 
@@ -1636,6 +1633,18 @@ KEYBIND_REFERENCE = {
         'prev_tab': 'BTab (Shift+Tab)',
         'filter_list': 'f or /',
         'reset_filter': 'r',
+        'select_in_list': 'Enter on the cursored row IS the CONFIRM action on '
+                          'SCENARIO / PROFESSION / BACKGROUND / SKILLS — without '
+                          'it the cursor moves but the spawn-side selection '
+                          'stays whatever was previously committed (default '
+                          'Evacuee + Survivor). Filter+Enter only closes the '
+                          'filter dialog; a SECOND Enter is the CONFIRM',
+        'order_matters': 'Set scenario FIRST, then profession, then stats, then '
+                         'traits, then name. CDDA reset_scenario cascade-wipes '
+                         'profession/stats/traits when a new scenario is '
+                         'committed, and reset_profession cascade-wipes stats '
+                         'and traits — order any other way and earlier work is '
+                         'silently lost',
         'finalize': 'Tab past DESCRIPTION (prompts confirm; case-sensitive Y)',
         'esc_warning': 'Esc opens "Return to main menu?" — use BTab to step '
                        'back without losing the character',
