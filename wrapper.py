@@ -275,17 +275,120 @@ def wait_for_change(before=None, timeout=3.0, interval=0.15,
     return before
 
 
-def drive_keys(keys, timeout=3.0):
+def drive_keys(keys, timeout=3.0, auto_dismiss=True):
     """Send keys one at a time, waiting for each change and stopping on
-    blocking modal states so later keys do not spill into the wrong screen."""
+    blocking modal states so later keys do not spill into the wrong screen.
+    When auto_dismiss is True (default), interrupting overlays that have a
+    safe answer (Y on "Stop moving items?" / "Really step into raspberry
+    bush?" / "You are freezing!", Escape on a stray pause menu or Actions
+    overlay) get handled before each key, so a long key chain doesn't get
+    silently swallowed by the first nuisance prompt that fires mid-walk."""
     raw = capture_raw()
     for key in keys:
+        if auto_dismiss:
+            raw = dismiss_blocking_overlays(raw)
         before = raw
         send_keys(key)
         raw = wait_for_change(before=before, timeout=timeout)
         if detect_mode(raw) in STOP_MODES:
             break
     return raw
+
+
+# Confirms that have an obviously-safe Y answer when they fire during
+# normal play. Each entry is a substring (case-sensitive) that, when found
+# anywhere in the current capture together with `[Y]es [N]o`, gets a Y.
+# All of these were observed wedging Claude's runs by silently freezing
+# every subsequent keystroke until manually dismissed.
+SAFE_Y_CONFIRMS = (
+    'Stop moving items',
+    'Stop hauling',
+    'Really step into',          # raspberry bush, brambles, glass, etc.
+    'You are freezing',          # case-sensitive Y to stop hauling/moving
+    'Stop reading',
+    'Stop crafting',
+    'Stop construction',
+    'Stop disassembling',
+)
+
+# In-grid overlay boxes that the box-vert mode-detector misses because they
+# render as a small panel inside the gameplay grid rather than as a full-
+# screen popup. Detected by literal-string match against the capture; the
+# fix is always Escape.
+OVERLAY_ESCAPE_MARKERS = (
+    'MAIN MENU',                  # in-game pause menu
+    '< Actions >',                # NPC interaction wheel
+    'Wield item',                 # w menu when fired by accident
+    'Wear item',                  # W menu when fired by accident
+    'Use item',                   # ' menu (apostrophe collides with bash)
+    'Eat',                        # E menu when fired by accident
+    'Take off',                   # T overlap with travel-to
+    'Construction',               # * menu when fired by accident
+    'Safe mode manager',          # pause-menu sub-page
+    'Auto pickup manager',
+    'Distractions manager',
+)
+
+
+def dismiss_blocking_overlays(raw=None, max_attempts=4):
+    """Walk through the current capture looking for SAFE_Y_CONFIRMS and
+    OVERLAY_ESCAPE_MARKERS, answering or escaping them in turn. Returns
+    the post-dismiss capture. Bounded by max_attempts so a popup that
+    refuses to close (e.g. one that re-fires from the same state) doesn't
+    spin forever."""
+    if raw is None:
+        raw = capture_raw()
+    for _ in range(max_attempts):
+        text = strip_ansi(raw)
+        # Y-answerable confirms first; they're cheap and they're what
+        # actually freezes long walks.
+        if '[Y]es' in text and any(s in text for s in SAFE_Y_CONFIRMS):
+            send_keys('Y')
+            raw = wait_for_change(before=raw, timeout=1.0)
+            continue
+        # Stray menus / item overlays — Escape closes them.
+        if any(marker in text for marker in OVERLAY_ESCAPE_MARKERS):
+            send_keys('Escape')
+            raw = wait_for_change(before=raw, timeout=1.2)
+            continue
+        return raw
+    return raw
+
+
+def safemode_status(raw=None):
+    """Return True if the sidebar shows 'Safe: On'. Cheap; uses the same
+    capture pattern as the rest of the wrapper."""
+    if raw is None:
+        raw = capture_raw()
+    return 'Safe: On' in strip_ansi(raw)
+
+
+def safemode_off(force=False):
+    """Toggle CDDA's global safe mode off via the `!` keybinding. CDDA
+    auto-re-enables safe mode whenever a hostile is in awareness range,
+    so callers walking past a known monster need to call this between
+    moves. With force=True we always send `!`; otherwise we only send it
+    when 'Safe: On' is currently visible. Returns the new safemode state
+    as a bool (True = still on)."""
+    if not force and not safemode_status():
+        return False
+    send_keys('!')
+    time.sleep(0.3)
+    return safemode_status()
+
+
+def cancel_activity():
+    """Interrupt whatever long-running Activity (haul, craft, sleep, wait)
+    is currently consuming the player's turn budget. CDDA prompts a
+    case-sensitive Y to stop; we send the standard '.' interrupt then
+    answer Y to any 'Stop X?' confirm that follows."""
+    send_keys('.')
+    time.sleep(0.3)
+    raw = capture_raw()
+    text = strip_ansi(raw)
+    if '[Y]es' in text and 'Stop' in text:
+        send_keys('Y')
+        wait_for_change(before=raw, timeout=1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -1627,6 +1730,23 @@ KEYBIND_REFERENCE = {
         'save_quit': 'S (case sensitive; conflicts with sleep-Y-S)',
         'quicksave': 'pause menu → b',
         'help': '?',
+        'safe_mode_toggle': '! (must reach CDDA un-mangled — bash history '
+                            'expansion can swallow it; route through '
+                            'wrapper.py safemode_off, which calls '
+                            "send_keys('!') from inside Python)",
+        'ignore_one_monster': "' (apostrophe; collides with bash quoting AND "
+                              "with CDDA's Use-item binding when Use-item is "
+                              "active — same Python-direct routing applies)",
+        'cancel_activity': '. (interrupt) then Y to confirm — wrapper.py '
+                           'cancel_activity does both. Required after an '
+                           'accidental hauling toggle, otherwise every '
+                           'subsequent move is consumed by the auto-haul',
+        'auto_dismiss': 'wrapper.py dismiss walks the screen for known '
+                        'safe-Y confirms ("Stop moving items?", "Really '
+                        'step into raspberry bush?", "You are freezing!") '
+                        'and Escape-able overlays (pause menu, Actions, '
+                        'Wield/Wear/Use overlays). drive_keys auto-runs '
+                        'this before each key by default',
     },
     'chargen': {
         'next_tab': 'Tab',
@@ -1753,6 +1873,31 @@ def main():
         if args and args[0] == 'status':
             lines = [line for line in chargen_status() if not line.startswith('wsl:')]
             emit({'header': '[chargen status]', 'lines': lines}, as_json)
+            return
+
+        if args and args[0] == 'safemode_off':
+            still_on = safemode_off(force=True)
+            if as_json:
+                print(json.dumps({'safe_on': still_on}))
+            else:
+                print(f'[safemode_off] safe_on={still_on}')
+            return
+
+        if args and args[0] == 'dismiss':
+            raw = dismiss_blocking_overlays()
+            mode = detect_mode(raw)
+            if as_json:
+                print(json.dumps({'mode': mode}))
+            else:
+                print(f'[dismiss] mode={mode}')
+            return
+
+        if args and args[0] == 'cancel_activity':
+            cancel_activity()
+            if as_json:
+                print(json.dumps({'ok': True}))
+            else:
+                print('[cancel_activity] sent')
             return
 
         if args and args[0] == 'filter' and len(args) > 1:
