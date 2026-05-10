@@ -431,15 +431,13 @@ def main():
                 return
 
     base_cmd = get_wrapper_command()
-    is_wsl = base_cmd and 'wsl.exe' in base_cmd[0].lower()
-    if is_wsl:
-        # wsl.exe -- ... joins everything after `--` into one string and runs
-        # it through bash, which then interprets shell metachars (`<`, `>`,
-        # `;`, `&`, etc.) in the user's args. Pre-quote so `cdda.py do <`
-        # (lowercase 'less' mapped to literal '<') doesn't trip bash.
-        forwarded_args = [shlex.quote(a) for a in (json_flag + args)]
-    else:
-        forwarded_args = json_flag + args
+    # wsl.exe -- env <vars> python3 wrapper.py <args> passes <args> straight
+    # to env (which exec's python3) without any bash in the loop, so shell
+    # metachars and spaces are inert. An earlier version shlex.quote'd these
+    # for "bash safety", which actually leaked literal POSIX single quotes
+    # through to wrapper.py — `cdda.py filter "Middle of Nowhere"` would
+    # filter for `'Middle of Nowhere'` (matches nothing). Pass args raw.
+    forwarded_args = json_flag + args
     cmd = base_cmd + forwarded_args
 
     run_env = os.environ.copy()

@@ -1128,34 +1128,50 @@ def _read_stat_value(stat_name):
 
 def chargen_set_stats(values):
     """Set chargen stats to target values. `values` is a dict keyed by
-    'str'/'dex'/'int'/'per' (any subset). Tabs to STATS first if needed,
-    walks the cursor to each stat row, and adjusts via Left/Right with
-    a value re-read after each press so a dropped key doesn't desync the
-    counter. Returns the post-set values for verification."""
+    'str'/'dex'/'int'/'per' (any subset). For each stat we re-anchor the
+    cursor to the top of the stat list and walk down by index, so a single
+    drifted Up/Down doesn't compound across stats. After each Left/Right
+    we re-read the row's value: if the value didn't move (and the press
+    wasn't bouncing off a min/max boundary), the cursor isn't on this stat
+    and we abort that stat with whatever it currently reads."""
     if not _go_to_chargen_tab('STATS'):
         raise RuntimeError('could not navigate to STATS tab')
 
-    # Slam the cursor to the top of the stat list.
-    for _ in range(len(CHARGEN_STAT_NAMES) + 2):
-        send_keys('Up')
-        time.sleep(0.05)
-
     actual = {}
     for idx, stat_name in enumerate(CHARGEN_STAT_NAMES):
-        if idx > 0:
+        # Re-anchor: slam Up past the top of the list, then Down to row idx.
+        for _ in range(len(CHARGEN_STAT_NAMES) + 2):
+            send_keys('Up')
+            time.sleep(0.06)
+        for _ in range(idx):
             send_keys('Down')
             time.sleep(0.12)
+
         key = stat_name.lower()[:3]
         actual[key] = _read_stat_value(stat_name)
         if key not in values:
             continue
         target = int(values[key])
-        for _ in range(20):
+
+        prev = actual[key]
+        stuck = 0
+        for _ in range(30):
             cur = _read_stat_value(stat_name)
             if cur is None or cur == target:
                 break
             send_keys('Right' if cur < target else 'Left')
-            time.sleep(0.18)
+            time.sleep(0.20)
+            new = _read_stat_value(stat_name)
+            if new == prev:
+                stuck += 1
+                if stuck >= 2:
+                    # Two presses, no movement — cursor must be on a different
+                    # row than this stat. Better to abort than keep nudging
+                    # whichever stat we actually have focus on.
+                    break
+            else:
+                stuck = 0
+            prev = new
         actual[key] = _read_stat_value(stat_name)
     return actual
 
@@ -1179,11 +1195,21 @@ def chargen_set_name(name):
     return {'name': m.group(1).strip() if m else None}
 
 
-def chargen_finalize(expected_scenario=None):
-    """Walk to DESCRIPTION (re-asserting the scenario en route if requested,
-    so a cursor that drifted off the intended scenario gets pulled back)
-    and Tab past DESCRIPTION to trigger the finalize confirm. Y commits.
-    Returns the post-finalize mode so callers can confirm spawn."""
+def chargen_finalize(expected_scenario=None, expected_profession=None, verify=True):
+    """Walk to DESCRIPTION and Tab past it to trigger the finalize confirm.
+    If `expected_scenario` and/or `expected_profession` are given, re-filter
+    them in (profession first, scenario last so SCENARIO is the most-recently-
+    touched tab — empirically the chargen state for SCENARIO is the most
+    fragile and easiest to revert by intermediate cursor work). When
+    `verify` is True (default), parse the DESCRIPTION tab for the expected
+    names; if they're missing, return ok=False with a reason instead of
+    finalizing into a wrong build."""
+    if expected_profession:
+        if not _go_to_chargen_tab('PROFESSION'):
+            raise RuntimeError('could not navigate to PROFESSION tab')
+        chargen_filter_reset()
+        chargen_filter(expected_profession)
+
     if expected_scenario:
         if not _go_to_chargen_tab('SCENARIO'):
             raise RuntimeError('could not navigate to SCENARIO tab')
@@ -1192,6 +1218,16 @@ def chargen_finalize(expected_scenario=None):
 
     if not _go_to_chargen_tab('DESCRIPTION'):
         raise RuntimeError('could not navigate to DESCRIPTION tab')
+
+    if verify:
+        text = strip_ansi(capture_raw())
+        issues = []
+        if expected_scenario and expected_scenario not in text:
+            issues.append(f'expected_scenario {expected_scenario!r} not visible in DESCRIPTION')
+        if expected_profession and expected_profession not in text:
+            issues.append(f'expected_profession {expected_profession!r} not visible in DESCRIPTION')
+        if issues:
+            return {'ok': False, 'mode': 'chargen', 'reason': '; '.join(issues)}
 
     send_keys('Tab')
     raw = wait_for_change(timeout=2.0)
@@ -1573,7 +1609,9 @@ KEYBIND_REFERENCE = {
             'h/j/k/l': 'W/S/N/E (vi)',
             'y/u/b/n': 'NW/NE/SW/SE',
             'arrows': 'cardinal',
-            'Shift+dir': 'auto-walk until obstacle',
+            'Shift+dir': 'single force-step (will smash/open obstacles, NOT auto-walk)',
+            'auto_travel': 'open overmap (m), move cursor to destination, T to travel '
+                           '(no default keybinding for in-pane auto-walk in this build)',
         },
         'pickup': 'g (then auto-handled by wrapper.py pickup)',
         'examine': 'e then direction (or wrapper.py examine DIR)',
@@ -1759,7 +1797,9 @@ def main():
 
         if args and args[0] == 'finalize':
             scenario = args[1] if len(args) > 1 else None
-            outcome = chargen_finalize(expected_scenario=scenario)
+            profession = args[2] if len(args) > 2 else None
+            outcome = chargen_finalize(expected_scenario=scenario,
+                                       expected_profession=profession)
             if as_json:
                 print(json.dumps(outcome, ensure_ascii=False))
             else:
